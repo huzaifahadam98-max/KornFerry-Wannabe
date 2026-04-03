@@ -1,12 +1,25 @@
+export interface CompetencyScore {
+  name: string;
+  sup: number;
+  sub: number;
+  peer: number;
+  avg: number;
+  gap: number;
+}
+
+export type ReportCategory = 'Normal' | 'CE' | 'CO';
+
 export interface Employee {
   id: string;
   name: string;
   jobTitle: string;
   department: string;
-  superiorFeedback: string;
-  subordinateFeedback: string;
-  peerFeedback: string;
-  // Optional quantitative scores could be added here if needed for deeper analysis
+  reportType: ReportCategory;
+  overallLES: number;
+  overallPMS: string;
+  questions: number[];
+  feedback: string;
+  competencies: CompetencyScore[];
 }
 
 export interface AnalysisResult {
@@ -32,10 +45,4 @@ export interface AnalysisResult {
     exposure: string;
     education: string;
   };
-}
-
-export interface ReportData {
-  employee: Employee;
-  analysis: AnalysisResult;
-  timestamp: string;
 }

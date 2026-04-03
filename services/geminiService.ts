@@ -1,6 +1,6 @@
 import { GoogleGenAI, Type, Schema } from "@google/genai";
 import { Employee, AnalysisResult } from '../types';
-import { KFLA_SYSTEM_INSTRUCTION } from '../constants';
+import { KFLA_SYSTEM_INSTRUCTION, COMPETENCY_DEFINITIONS_NORMAL, COMPETENCY_DEFINITIONS_CE_CO } from '../constants';
 
 const responseSchema: Schema = {
   type: Type.OBJECT,
@@ -81,16 +81,47 @@ export const analyzeEmployeeFeedback = async (employee: Employee): Promise<Analy
 
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
+  // 1. Select the correct competency context based on report type
+  const isExecutive = employee.reportType === 'CE' || employee.reportType === 'CO';
+  const competencyContext = isExecutive ? COMPETENCY_DEFINITIONS_CE_CO : COMPETENCY_DEFINITIONS_NORMAL;
+
+  // Helper to format scores for AI prompt (0 -> N/A)
+  const formatScore = (val: number) => val > 0 ? `${val.toFixed(1)}%` : 'N/A';
+
+  // 2. Format Quantitative Scores for the prompt (Note: Scores are 0-100)
+  const scoresSummary = employee.competencies.map(c => 
+    `- ${c.name}: Avg ${formatScore(c.avg)} [Sup: ${formatScore(c.sup)}, Sub: ${formatScore(c.sub)}, Peer: ${formatScore(c.peer)}]`
+  ).join('\n');
+
+  // 3. Construct the comprehensive prompt
   const prompt = `
-    Analyze the following feedback for:
+    Analyze the following 360-degree feedback data for:
     Name: ${employee.name}
+    Role Category: ${employee.reportType}
     Job Title: ${employee.jobTitle}
+    Department: ${employee.department}
+
+    PART 1: COMPETENCY MODEL CONTEXT
+    Use these definitions to interpret the data:
+    ${competencyContext}
+
+    PART 2: QUANTITATIVE DATA (Scale: 0-100%)
+    (Format: Competency: Average [Superior, Subordinate, Peer])
+    Note: "N/A" indicates data is missing for that rater group. Do NOT treat N/A as 0 or low performance.
+    ${scoresSummary}
+
+    PART 3: QUALITATIVE FEEDBACK
+    Superior: "${employee.superiorFeedback}"
+    Subordinate: "${employee.subordinateFeedback}"
+    Peer: "${employee.peerFeedback}"
     
-    Superior Feedback: "${employee.superiorFeedback}"
-    Subordinate Feedback: "${employee.subordinateFeedback}"
-    Peer Feedback: "${employee.peerFeedback}"
-    
-    Return the analysis strictly in JSON format as per the schema.
+    INSTRUCTIONS:
+    - Synthesize the quantitative scores (0-100%) with the qualitative comments to find the true story.
+    - HIGH SCORES: > 90% (Strength).
+    - LOW SCORES: < 70% (Potential Weakness).
+    - If a score is high but feedback is missing, treat it as a silent strength.
+    - If there is a large gap (> 15%) between rater groups (e.g. Self vs Peer), highlight this in Blind Spots.
+    - Return the analysis strictly in JSON format as per the schema.
   `;
 
   try {
@@ -111,7 +142,6 @@ export const analyzeEmployeeFeedback = async (employee: Employee): Promise<Analy
     }
   } catch (error) {
     console.error("Gemini API Error:", error);
-    // Fallback or rethrow
     throw error;
   }
 };

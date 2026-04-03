@@ -1,10 +1,11 @@
-import React, { useState, useMemo, useRef } from 'react';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
 import { FileUpload } from './components/FileUpload';
 import { ReportView } from './components/ReportView';
-import { parseExcel, generateBulkExcelReport } from './services/excelService';
+import { parseExcel, generateBulkExcelReport, generateBulkHtmlExport } from './services/excelService';
 import { analyzeEmployeeFeedback } from './services/geminiService';
-import { Employee, AnalysisResult } from './types';
-import { Users, FileSpreadsheet, Loader2, Search, DownloadCloud, Filter, CheckSquare, Square, X, AlertCircle, CheckCircle, Play } from 'lucide-react';
+import { getAnalysisFromCache, saveAnalysisToCache, clearAllAnalysisCache, getCacheSize } from './services/cacheService';
+import { Employee, AnalysisResult, ReportCategory } from './types';
+import { Users, FileSpreadsheet, Loader2, Search, DownloadCloud, Filter, CheckSquare, Square, X, AlertCircle, CheckCircle, Play, Trash2, Database, Settings, Code } from 'lucide-react';
 
 const App: React.FC = () => {
   const [employees, setEmployees] = useState<Employee[]>([]);
@@ -12,7 +13,12 @@ const App: React.FC = () => {
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [cachedCount, setCachedCount] = useState<number>(0);
   
+  // File & Config State
+  const [currentFile, setCurrentFile] = useState<File | null>(null);
+  const [reportCategory, setReportCategory] = useState<ReportCategory>('Normal');
+
   // Filtering & Search State
   const [searchTerm, setSearchTerm] = useState('');
   const [departmentFilter, setDepartmentFilter] = useState<string>('All');
@@ -47,6 +53,40 @@ const App: React.FC = () => {
     results: []
   });
 
+  // Initialize cache count on load
+  useEffect(() => {
+    setCachedCount(getCacheSize());
+  }, []);
+
+  // Re-parse file when category changes
+  useEffect(() => {
+    const reprocessFile = async () => {
+      if (currentFile) {
+        try {
+          setIsLoading(true);
+          setError(null);
+          // Parse with the new category
+          const data = await parseExcel(currentFile, reportCategory);
+          const validEmployees = data.filter(e => e.name && e.name !== 'Unknown');
+          setEmployees(validEmployees);
+          
+          // Clear selection if re-parsed to avoid ID mismatches
+          setSelectedIds(new Set());
+          setSelectedEmployee(null);
+          setAnalysis(null);
+          setDepartmentFilter('All');
+          setRoleFilter('All');
+        } catch (err) {
+          console.error(err);
+          setError('Failed to re-process file for the selected category.');
+        } finally {
+          setIsLoading(false);
+        }
+      }
+    };
+    reprocessFile();
+  }, [reportCategory, currentFile]);
+
   // Derived Data for Filters
   const uniqueDepartments = useMemo(() => {
     const depts = new Set(employees.map(e => e.department).filter(Boolean));
@@ -61,7 +101,7 @@ const App: React.FC = () => {
   // Filter Logic
   const filteredEmployees = useMemo(() => {
     return employees.filter(e => {
-      const matchesSearch = e.name.toLowerCase().includes(searchTerm.toLowerCase()) || e.id.toString().includes(searchTerm);
+      const matchesSearch = (e.name || '').toString().toLowerCase().includes(searchTerm.toLowerCase()) || e.id.toString().includes(searchTerm);
       const matchesDept = departmentFilter === 'All' || e.department === departmentFilter;
       const matchesRole = roleFilter === 'All' || e.jobTitle === roleFilter;
       return matchesSearch && matchesDept && matchesRole;
@@ -69,21 +109,15 @@ const App: React.FC = () => {
   }, [employees, searchTerm, departmentFilter, roleFilter]);
 
   const handleFileUpload = async (file: File) => {
-    try {
-      setIsLoading(true);
-      setError(null);
-      const data = await parseExcel(file);
-      // Filter out rows that might be empty or headers
-      const validEmployees = data.filter(e => e.name && e.name !== 'Unknown');
-      setEmployees(validEmployees);
-      setSelectedIds(new Set()); // Reset selection on new upload
-      setDepartmentFilter('All');
-      setRoleFilter('All');
-    } catch (err) {
-      console.error(err);
-      setError('Failed to parse Excel file. Please ensure it follows the correct format.');
-    } finally {
-      setIsLoading(false);
+    setCurrentFile(file); 
+    // The useEffect above will trigger the actual parsing
+  };
+
+  const handleClearCache = () => {
+    if (window.confirm(`Are you sure you want to clear ${cachedCount} saved reports? This cannot be undone.`)) {
+      clearAllAnalysisCache();
+      setCachedCount(0);
+      setAnalysis(null); // Clear current view if any
     }
   };
 
@@ -92,10 +126,23 @@ const App: React.FC = () => {
       setIsLoading(true);
       setError(null);
       setSelectedEmployee(employee);
-      // Reset previous analysis while loading new one
       setAnalysis(null);
+
+      // 1. Check Cache
+      const cachedResult = getAnalysisFromCache(employee.id);
+      if (cachedResult) {
+        setAnalysis(cachedResult);
+        setIsLoading(false);
+        return;
+      }
       
+      // 2. Fetch if not cached
       const result = await analyzeEmployeeFeedback(employee);
+      
+      // 3. Save to cache
+      saveAnalysisToCache(employee.id, result);
+      setCachedCount(prev => prev + 1);
+      
       setAnalysis(result);
     } catch (err) {
       console.error(err);
@@ -151,6 +198,19 @@ const App: React.FC = () => {
     generateBulkExcelReport(bulkState.results);
   };
 
+  const handleDownloadHtmlBulk = async () => {
+    if (bulkState.results.length === 0) {
+      alert("No results to export.");
+      return;
+    }
+    try {
+      await generateBulkHtmlExport(bulkState.results);
+    } catch (error) {
+      console.error("Failed to generate HTML export:", error);
+      alert("Failed to generate HTML export. Please try again.");
+    }
+  };
+
   const handleCloseBulkModal = () => {
     setBulkState(prev => ({ ...prev, isOpen: false }));
   };
@@ -195,10 +255,25 @@ const App: React.FC = () => {
           processed: i, // Show completed count, so currently processing is i+1 conceptually
         }));
 
-        // Reuse existing analysis if available
+        // 1. Check Cache First
+        const cachedResult = getAnalysisFromCache(emp.id);
+        if (cachedResult) {
+           addBulkLog(`Using saved report for ${emp.name}`);
+           results.push({ employee: emp, analysis: cachedResult });
+           setBulkState(prev => ({ 
+             ...prev, 
+             success: prev.success + 1,
+             results: [...prev.results, { employee: emp, analysis: cachedResult }] 
+           }));
+           // Skip API call and wait time
+           continue;
+        }
+
+        // 2. Reuse in-memory analysis if it's the currently viewed one (Edge case)
         if (selectedEmployee?.id === emp.id && analysis) {
-           addBulkLog(`Using cached result for ${emp.name}`);
+           addBulkLog(`Using current view for ${emp.name}`);
            results.push({ employee: emp, analysis: analysis });
+           saveAnalysisToCache(emp.id, analysis); // Ensure it's in persistent cache too
            setBulkState(prev => ({ 
              ...prev, 
              success: prev.success + 1,
@@ -207,16 +282,13 @@ const App: React.FC = () => {
            continue;
         }
 
-        // Retry logic
+        // Retry logic for API
         let success = false;
         let retryCount = 0;
-        const maxRetries = 3; // For regular errors (not 429)
+        const maxRetries = 3; 
 
         while (!success && !stopProcessingRef.current) {
           try {
-            // Rate limiting delay
-            // Gemini Free Tier often has 15 RPM limits. 4s delay = 15 RPM.
-            // Using 4000ms delay to stay safe.
             const baseDelay = 4000;
             
             if (i > 0 || retryCount > 0) {
@@ -228,6 +300,10 @@ const App: React.FC = () => {
 
             const result = await analyzeEmployeeFeedback(emp);
             
+            // Save to Cache immediately
+            saveAnalysisToCache(emp.id, result);
+            setCachedCount(prev => prev + 1);
+
             const item = { employee: emp, analysis: result };
             results.push(item);
             setBulkState(prev => ({ 
@@ -241,22 +317,15 @@ const App: React.FC = () => {
           } catch (e: any) {
              const errorMsg = e instanceof Error ? e.message : String(e);
              
-             // Smart Rate Limit Handling (429)
              if (errorMsg.includes("429") || errorMsg.includes("quota") || errorMsg.includes("RESOURCE_EXHAUSTED")) {
-                addBulkLog(`Daily/Minute Quota limit reached.`);
-                
-                // Extract wait time from error message like "Please retry in 32.206s"
-                let waitTime = 32000; // Default safe wait
+                addBulkLog(`Quota limit reached.`);
+                let waitTime = 32000; 
                 const match = errorMsg.match(/retry in (\d+(\.\d+)?)s/);
                 if (match && match[1]) {
-                    // Parse seconds to ms, add 2s buffer
                     waitTime = Math.ceil(parseFloat(match[1])) * 1000 + 2000;
                 }
-
-                addBulkLog(`Pausing for ${Math.round(waitTime/1000)}s to cool down...`);
+                addBulkLog(`Pausing for ${Math.round(waitTime/1000)}s...`);
                 await new Promise(r => setTimeout(r, waitTime));
-                
-                // Do NOT increment retryCount for quota errors, just loop again indefinitely
                 continue; 
              }
 
@@ -264,9 +333,9 @@ const App: React.FC = () => {
              retryCount++;
              
              if (retryCount >= maxRetries) {
-               addBulkLog(`Failed to analyze ${emp.name} after ${maxRetries} attempts.`);
+               addBulkLog(`Failed to analyze ${emp.name}`);
                setBulkState(prev => ({ ...prev, failed: prev.failed + 1 }));
-               break; // Move to next employee
+               break; 
              }
           }
         }
@@ -278,7 +347,7 @@ const App: React.FC = () => {
       setBulkState(prev => ({ 
         ...prev, 
         isComplete: true, 
-        processed: prev.total, // Ensure bar is full if complete
+        processed: prev.total, 
         currentName: 'Completed',
         logs: [...prev.logs, "Processing finished."]
       }));
@@ -348,8 +417,8 @@ const App: React.FC = () => {
 
               {/* Log Window */}
               <div className="bg-gray-900 rounded-lg p-3 font-mono text-xs text-green-400 h-32 overflow-hidden flex flex-col justify-end">
-                 {bulkState.logs.map((log, idx) => (
-                   <div key={idx} className="truncate">> {log}</div>
+                  {bulkState.logs.map((log, idx) => (
+                   <div key={idx} className="truncate">&gt; {log}</div>
                  ))}
               </div>
             </div>
@@ -365,7 +434,6 @@ const App: React.FC = () => {
                  </button>
                )}
                
-               {/* Always allow download if results exist, even if stopped or incomplete */}
                <button 
                  onClick={handleDownloadBulk}
                  disabled={bulkState.results.length === 0}
@@ -374,7 +442,18 @@ const App: React.FC = () => {
                  `}
                >
                  <DownloadCloud size={18} />
-                 Download Report {bulkState.results.length > 0 && `(${bulkState.results.length})`}
+                 Excel Data
+               </button>
+
+               <button 
+                 onClick={handleDownloadHtmlBulk}
+                 disabled={bulkState.results.length === 0}
+                 className={`flex items-center gap-2 px-4 py-2 rounded-lg font-bold shadow-sm text-white transition-colors
+                    ${bulkState.results.length === 0 ? 'bg-gray-400 cursor-not-allowed' : 'bg-indigo-600 hover:bg-indigo-700'}
+                 `}
+               >
+                 <Code size={18} />
+                 HTML Export
                </button>
                
                {bulkState.isComplete && (
@@ -399,7 +478,22 @@ const App: React.FC = () => {
             </div>
             <h1 className="text-xl font-bold text-gray-900 tracking-tight">LES 360 Analytics</h1>
           </div>
-          <div className="text-sm text-gray-500 hidden sm:block">Korn Ferry Leadership Architect</div>
+          <div className="flex items-center gap-4">
+             {cachedCount > 0 && (
+                <div className="flex items-center gap-2 text-xs text-gray-500 bg-gray-50 px-3 py-1.5 rounded-full border border-gray-200">
+                    <Database size={12} className="text-indigo-500" />
+                    <span>{cachedCount} Saved Reports</span>
+                    <button 
+                      onClick={handleClearCache}
+                      className="ml-2 text-red-400 hover:text-red-600 transition-colors p-0.5"
+                      title="Clear saved reports"
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                </div>
+             )}
+             <div className="text-sm text-gray-500 hidden sm:block">Korn Ferry Leadership Architect</div>
+          </div>
         </div>
       </header>
 
@@ -424,6 +518,25 @@ const App: React.FC = () => {
             <div className="w-full lg:w-1/3 bg-white rounded-xl shadow-sm border border-gray-200 flex flex-col h-[calc(100vh-140px)] sticky top-24">
                 {/* Controls Area */}
                 <div className="p-4 border-b bg-gray-50 space-y-3 shrink-0">
+                    {/* Category Selector (New Feature) */}
+                    <div className="mb-4 bg-indigo-50 p-3 rounded-lg border border-indigo-100">
+                        <label className="text-xs font-bold text-indigo-800 uppercase tracking-wide flex items-center gap-1.5 mb-2">
+                           <Settings size={12} /> Report Category
+                        </label>
+                        <select 
+                            value={reportCategory}
+                            onChange={(e) => setReportCategory(e.target.value as ReportCategory)}
+                            className="w-full bg-white border border-indigo-200 text-gray-800 text-sm rounded-md focus:ring-indigo-500 focus:border-indigo-500 block p-2"
+                        >
+                            <option value="Normal">Normal (28 Questions)</option>
+                            <option value="CE">Chief Executive (CE)</option>
+                            <option value="CO">Chief Officer (CO)</option>
+                        </select>
+                        <p className="text-[10px] text-indigo-600 mt-1.5">
+                            *Switching categories re-processes the uploaded file.
+                        </p>
+                    </div>
+
                     <div className="flex justify-between items-center">
                       <h2 className="font-semibold text-gray-700 flex items-center gap-2">
                           <Users size={18} /> Employees
@@ -492,6 +605,8 @@ const App: React.FC = () => {
                     {filteredEmployees.map((emp) => {
                         const isSelected = selectedIds.has(emp.id);
                         const isActive = selectedEmployee?.id === emp.id;
+                        const isCached = getAnalysisFromCache(emp.id) !== null;
+                        
                         return (
                           <div 
                             key={emp.id}
@@ -519,7 +634,14 @@ const App: React.FC = () => {
                                     ${isActive ? 'border-l-4 border-l-indigo-600' : 'border-l-4 border-l-transparent pl-4'}
                                 `}
                              >
-                                <span className="font-medium text-gray-900 text-sm">{emp.name}</span>
+                                <div className="flex items-center justify-between">
+                                  <span className="font-medium text-gray-900 text-sm">{emp.name}</span>
+                                  {isCached && (
+                                    <span title="Cached Report Available">
+                                      <Database size={10} className="text-green-500" />
+                                    </span>
+                                  )}
+                                </div>
                                 <div className="flex items-center gap-2 text-xs text-gray-500">
                                   <span className="truncate max-w-[120px]">{emp.jobTitle}</span>
                                   <span className="w-1 h-1 bg-gray-300 rounded-full"></span>
